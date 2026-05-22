@@ -14,21 +14,21 @@ export NO_PROXY="*"
 ACTIVE_IFACES_LIST=""
 ACTIVE_IFACE=""
 
-# 1c. 默认带宽测速大小与超时参数 (完美自适应不同带宽环境，支持命令行动态参数配置)
-TEST_BYTES=25000000       # 默认 25MB 大文件
+# 1c. 默认带宽测速大小与超时参数 (避开 Cloudflare WAF 对单请求 >= 10MB 的 429 速率限制)
+TEST_BYTES=8999999        # 默认 9MB 大文件 (WAF 限制为 10,000,000 字节)
 TEST_TIMEOUT=2            # 默认 2 秒超时
-TEST_MODE_NAME="标准模式 (25MB)"
+TEST_MODE_NAME="标准模式 (9MB)"
 
 # 解析命令行参数：支持 `./cf_speed_test.sh [fast|standard|gigabit]` 或简写
 if [ "$1" = "fast" ] || [ "$1" = "极速" ]; then
-  TEST_BYTES=10000000     # 10MB
+  TEST_BYTES=4999999      # 5MB 极速文件
   TEST_TIMEOUT=2          # 2s
-  TEST_MODE_NAME="极速模式 (10MB)"
+  TEST_MODE_NAME="极速模式 (5MB)"
   shift
 elif [ "$1" = "gigabit" ] || [ "$1" = "千兆" ] || [ "$1" = "thorough" ] || [ "$1" = "深度" ]; then
-  TEST_BYTES=50000000     # 50MB (支持千兆上限)
+  TEST_BYTES=9999999      # 9.99MB (WAF 豁免范围内的最大允许文件大小)
   TEST_TIMEOUT=3          # 3s (增加耗时以保证 TCP 窗口充分爬升)
-  TEST_MODE_NAME="千兆深度模式 (50MB)"
+  TEST_MODE_NAME="千兆深度模式 (10MB)"
   shift
 fi
 
@@ -348,17 +348,19 @@ get_latency() {
   if [ -n "$ACTIVE_IFACE" ]; then
     iface_opt="--interface $ACTIVE_IFACE"
   fi
-  # 使用 time_connect 探测物理 TCP 握手耗时 (1 RTT)，与小火箭等代理软件的测试标准保持一致
-  time_cost=$(curl $iface_opt -o /dev/null -s -w "%{time_connect}" --connect-timeout 2 --max-time 3 --noproxy "*" --resolve "speed.cloudflare.com:443:$ip" "https://speed.cloudflare.com/__down?bytes=0" 2>/dev/null)
+  # 使用 time_connect 探测物理 TCP 握手耗时 (1 RTT)，直接针对 IP 握手并使用 -k，完全避免触发 speed.cloudflare.com 的 WAF 并发 429 速率限制
+  time_cost=$(curl $iface_opt -o /dev/null -s -w "%{time_connect}" --connect-timeout 2 --max-time 3 --noproxy "*" "https://$ip" -k 2>/dev/null)
   local ec=$?
-  if [ $ec -eq 0 ] && [ -n "$time_cost" ]; then
-    local is_gt_zero
-    is_gt_zero=$(awk -v t="$time_cost" 'BEGIN { print (t > 0) }')
-    if [ "$is_gt_zero" -eq 1 ]; then
-      local ms
-      ms=$(awk -v t="$time_cost" 'BEGIN { printf "%.1f", t * 1000 }')
-      echo "$ms"
-      return
+  if [ $ec -eq 0 ] || [ $ec -eq 35 ] || [ $ec -eq 60 ] || [ $ec -eq 51 ] || [ $ec -eq 83 ]; then
+    if [ -n "$time_cost" ]; then
+      local is_gt_zero
+      is_gt_zero=$(awk -v t="$time_cost" 'BEGIN { print (t > 0) }')
+      if [ "$is_gt_zero" -eq 1 ]; then
+        local ms
+        ms=$(awk -v t="$time_cost" 'BEGIN { printf "%.1f", t * 1000 }')
+        echo "$ms"
+        return
+      fi
     fi
   fi
   echo "9999"
