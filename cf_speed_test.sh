@@ -10,8 +10,9 @@
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
 export NO_PROXY="*"
 
-# 1b. 动态探测活跃的物理网卡（如 en0）用于直连测速绑定，绕过 Clash TUN 网卡
-ACTIVE_IFACE=$(ifconfig | awk '/^en[0-9]+:/ { if (iface != "" && is_active == 1 && ip != "") { print iface; exit }; iface=substr($1, 1, length($1)-1); is_active=0; ip="" }; /status: active/ { is_active=1 }; /inet / { ip=$2 }; END { if (iface != "" && is_active == 1 && ip != "") { print iface } }' | head -n 1)
+# 1b. 初始化活跃网卡列表与当前活动网卡变量 (将在后文初始化)
+ACTIVE_IFACES_LIST=""
+ACTIVE_IFACE=""
 
 # 1c. 默认带宽测速大小与超时参数 (完美自适应不同带宽环境，支持命令行动态参数配置)
 TEST_BYTES=25000000       # 默认 25MB 大文件
@@ -56,6 +57,65 @@ check_requirements() {
     echo -e "${RED}[ERROR] 请在终端中安装上述缺失的工具后再运行此脚本。${NC}"
     exit 1
   fi
+}
+
+# 3b. 动态探测物理网卡与其 IP
+get_active_physical_interfaces() {
+  local candidate_ifaces=""
+  if [ "$(uname)" = "Darwin" ]; then
+    local ifaces
+    ifaces=$(ifconfig -l 2>/dev/null)
+    if [ -z "$ifaces" ]; then
+      ifaces=$(ifconfig | awk -F: '/^[a-z0-9]+/ {print $1}')
+    fi
+    for iface in $ifaces; do
+      # 排除回环网卡、虚拟网卡、VPN隧道网卡、Clash TUN 等
+      [[ "$iface" =~ ^(lo|gif|stf|utun|anpi|ap|awdl|llw|bridge) ]] && continue
+      
+      # 检测网卡状态是否为 active
+      local status=""
+      status=$(ifconfig "$iface" 2>/dev/null | grep -i "status:" | awk '{print $2}')
+      if [ -n "$status" ] && [ "$status" != "active" ]; then
+        continue
+      fi
+      
+      local ip=""
+      ip=$(ifconfig "$iface" 2>/dev/null | grep -w "inet" | awk '{print $2}' | head -n 1)
+      if [ -n "$ip" ] && [[ ! "$ip" =~ ^169\.254\. ]] && [[ ! "$ip" =~ ^127\. ]]; then
+        candidate_ifaces="${candidate_ifaces}${iface};${ip}\n"
+      fi
+    done
+  else
+    # Linux 系统物理网卡探测
+    local ifaces
+    ifaces=$(ip -o link show | awk -F': ' '{print $2}')
+    for iface in $ifaces; do
+      [[ "$iface" =~ ^(lo|tun|tap|wg|docker|br-) ]] && continue
+      if ! ip link show "$iface" | grep -q "UP"; then
+        continue
+      fi
+      local ip=""
+      ip=$(ip -o -4 addr show "$iface" | awk '{print $4}' | cut -d/ -f1 | head -n 1)
+      if [ -n "$ip" ] && [[ ! "$ip" =~ ^169\.254\. ]] && [[ ! "$ip" =~ ^127\. ]]; then
+        candidate_ifaces="${candidate_ifaces}${iface};${ip}\n"
+      fi
+    done
+  fi
+  echo -e "$candidate_ifaces" | grep -v '^$'
+}
+
+# 3c. 检测物理网卡是否能访问公网 (通过 Cloudflare Anycast 实测)
+check_interface_internet() {
+  local iface="$1"
+  local ip
+  # 使用 Cloudflare CDN 的几个高可用物理 Anycast IP 进行直连握手探测 (避免 Fake IP DNS 解析干扰)
+  local test_ips=("104.16.123.96" "104.16.124.96" "104.17.123.96" "104.17.124.96")
+  for ip in "${test_ips[@]}"; do
+    if curl --interface "$iface" -I -s --connect-timeout 2 --max-time 3 --noproxy "*" "https://$ip" -k >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 # 4. 内置 30+ 优选 CNAME 域名及中文备注
@@ -245,7 +305,18 @@ print_banner() {
     echo -e "  • 终端代理出口 IP    : ${CYAN}${egress_ip}${NC}"
   fi
   
-  if [ -n "$ACTIVE_IFACE" ]; then
+  if [ -n "$ACTIVE_IFACES_LIST" ]; then
+    local formatted_ifaces=""
+    while IFS=';' read -r iface ip; do
+      [ -z "$iface" ] && continue
+      if [ "$iface" = "$ACTIVE_IFACE" ]; then
+        formatted_ifaces="${formatted_ifaces} ${GREEN}${BOLD}${iface}(${ip})[活动]${NC}"
+      else
+        formatted_ifaces="${formatted_ifaces} ${GRAY}${iface}(${ip})${NC}"
+      fi
+    done <<< "$ACTIVE_IFACES_LIST"
+    echo -e "  • 物理测速绑定网卡    :${formatted_ifaces} (直连流量出口)"
+  elif [ -n "$ACTIVE_IFACE" ]; then
     echo -e "  • 物理测速绑定网卡    : ${GREEN}${ACTIVE_IFACE}${NC} (直连流量出口)"
   else
     echo -e "  • 物理测速绑定网卡    : ${YELLOW}未发现物理网卡，使用系统默认路由${NC}"
@@ -593,6 +664,31 @@ main() {
   TEMP_DIR=$(mktemp -d /tmp/cf_speed_test_XXXXXX)
   trap 'rm -rf "$TEMP_DIR"' EXIT
   
+  # 动态探测活跃的物理网卡列表并验证公网连通性
+  echo -ne "正在动态探测与连通性验证本地物理网卡...\r"
+  local candidates
+  candidates=$(get_active_physical_interfaces)
+  
+  ACTIVE_IFACES_LIST=""
+  if [ -n "$candidates" ]; then
+    while IFS=';' read -r iface ip; do
+      [ -z "$iface" ] && continue
+      if check_interface_internet "$iface"; then
+        ACTIVE_IFACES_LIST="${ACTIVE_IFACES_LIST}${iface};${ip}\n"
+      fi
+    done <<< "$candidates"
+  fi
+  ACTIVE_IFACES_LIST=$(echo -e "$ACTIVE_IFACES_LIST" | grep -v '^$')
+  
+  local iface_count=0
+  if [ -n "$ACTIVE_IFACES_LIST" ]; then
+    iface_count=$(echo -e "$ACTIVE_IFACES_LIST" | wc -l | tr -d ' ')
+  fi
+  
+  if [ "$iface_count" -eq 1 ]; then
+    ACTIVE_IFACE=$(echo -e "$ACTIVE_IFACES_LIST" | cut -d';' -f1)
+  fi
+  
   print_banner
   
   # Phase 1: 获取数据源
@@ -630,7 +726,22 @@ main() {
     exit 1
   fi
   
-  local LATENCY_RESULTS="$TEMP_DIR/latency_results.txt"
+  # 定义每个网卡的独立测速执行函数
+  run_speed_test_for_interface() {
+    local iface_name="$1"
+    local iface_ip="$2"
+    
+    ACTIVE_IFACE="$iface_name"
+    
+    # 重新渲染 Banner 以高亮当前活动网卡
+    print_banner
+    
+    echo -e "${BLUE}${BOLD}================================================================================${NC}"
+    echo -e " 🚀 ${YELLOW}${BOLD}正在评估网卡: ${GREEN}${iface_name:-系统默认}${NC} (${CYAN}${iface_ip:-默认路由}${NC}) 的 Cloudflare 优选性能...${NC}"
+    echo -e "${BLUE}${BOLD}================================================================================${NC}"
+    echo ""
+    
+    local LATENCY_RESULTS="$TEMP_DIR/latency_results.txt"
   > "$LATENCY_RESULTS"
   
   # 使用高兼容 POSIX 命名管道作为并发信号量
@@ -817,8 +928,8 @@ main() {
   echo -e "${BOLD}[Phase 4/5] 各运营商排行榜渲染${NC}"
   
   # 报表列宽定义
-  IP_W_RANK=6; IP_W_IP=16; IP_W_ISP=20; IP_W_LAT=12; IP_W_SPD=14; IP_W_SRC=20
-  CN_W_RANK=6; CN_W_IP=16; CN_W_ISP=20; CN_W_LAT=12; CN_W_SPD=14; CN_W_DOM=45
+  IP_W_RANK=6; IP_W_IP=17; IP_W_ISP=20; IP_W_LAT=12; IP_W_SPD=14; IP_W_SRC=20
+  CN_W_RANK=6; CN_W_IP=17; CN_W_ISP=20; CN_W_LAT=12; CN_W_SPD=14; CN_W_DOM=45
   
   print_isp_table "中国电信" "$CT_FINAL_RESULTS"
   echo ""
@@ -1056,6 +1167,31 @@ main() {
   }
   
   print_recommendation_card
+  
+  # 多网口顺序测速按任意键继续
+  if [ "$iface_count" -gt 1 ]; then
+    echo ""
+    echo -e "${YELLOW}网卡 ${GREEN}${iface_name}${YELLOW} 的测速已完成。${NC}"
+    if [ -t 0 ]; then
+      echo -e "${GRAY}按下 [Enter] 键开始评估下一个网卡...${NC}"
+      read -r
+    else
+      echo -e "${GRAY}检测到非交互式终端，将在 2 秒后自动评估下一个网卡...${NC}"
+      sleep 2
+    fi
+  fi
+}
+
+# 执行测速循环
+if [ "$iface_count" -gt 0 ]; then
+  while IFS=';' read -r iface ip; do
+    [ -z "$iface" ] && continue
+    run_speed_test_for_interface "$iface" "$ip"
+  done <<< "$ACTIVE_IFACES_LIST"
+else
+  # 兜底：无物理网卡，使用系统默认路由测速
+  run_speed_test_for_interface "" ""
+fi
 }
 
 main "$@"
